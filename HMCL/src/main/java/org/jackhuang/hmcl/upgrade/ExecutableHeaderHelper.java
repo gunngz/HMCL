@@ -23,13 +23,16 @@ import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileChannel.MapMode;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.Optional;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 import org.jackhuang.hmcl.util.io.IOUtils;
+import org.jetbrains.annotations.Nullable;
 
 import static java.nio.file.StandardOpenOption.*;
 import static org.jackhuang.hmcl.util.Lang.mapOf;
@@ -58,13 +61,32 @@ final class ExecutableHeaderHelper {
         }
     }
 
+    /// Reads the bundled executable header for a supported suffix, when present.
     private static Optional<byte[]> readHeader(ZipFile zip, String suffix) throws IOException {
-        String location = suffix2header.get(suffix);
+        @Nullable String location = suffix2header.get(suffix);
         if (location != null) {
-            ZipEntry entry = zip.getEntry(location);
+            @Nullable ZipEntry entry = zip.getEntry(location);
             if (entry != null && !entry.isDirectory()) {
                 try (InputStream in = zip.getInputStream(entry)) {
                     return Optional.of(IOUtils.readFully(in));
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    /// Identifies an existing launcher's header using the resources bundled in that launcher.
+    /// The file is read without memory mapping so it can be overwritten after this method returns.
+    private static Optional<String> detectHeaderSuffix(Path file) throws IOException {
+        try (ZipFile zip = new ZipFile(file.toFile())) {
+            for (String suffix : suffix2header.keySet()) {
+                Optional<byte[]> header = readHeader(zip, suffix);
+                if (header.isPresent()) {
+                    try (InputStream in = Files.newInputStream(file)) {
+                        if (Arrays.equals(header.get(), in.readNBytes(header.get().length))) {
+                            return Optional.of(suffix);
+                        }
+                    }
                 }
             }
         }
@@ -101,16 +123,20 @@ final class ExecutableHeaderHelper {
         }
     }
 
-    /**
-     * Copies the executable and appends the header according to the suffix.
-     */
+    /// Copies the executable using the destination's suffix, or its existing header when renamed.
+    /// The replacement header comes from the new launcher so updates also refresh the bootstrap code.
     public static void copyWithHeader(Path from, Path to) throws IOException {
+        Optional<String> suffix = getSuffix(to);
+        if (suffix.filter(s -> suffix2header.containsKey(s) || "jar".equals(s)).isEmpty() && Files.isRegularFile(to)) {
+            // Inspect the old launcher before opening the output channel truncates it.
+            suffix = detectHeaderSuffix(to);
+        }
+
         try (
                 FileChannel in = FileChannel.open(from, READ);
                 FileChannel out = FileChannel.open(to, CREATE, WRITE, TRUNCATE_EXISTING);
                 ZipFile zip = new ZipFile(from.toFile())
         ) {
-            Optional<String> suffix = getSuffix(to);
             if (suffix.isPresent()) {
                 Optional<byte[]> header = readHeader(zip, suffix.get());
                 if (header.isPresent()) {
